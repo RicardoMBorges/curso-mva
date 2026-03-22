@@ -1426,7 +1426,7 @@ PARAM_HELP = {
 # =====================================================
 # Sidebar: Data import + column mapping (MetaboAnalyst-like)
 # =====================================================
-st.sidebar.title("Data Import")
+st.sidebar.title("Importação dos dados")
 
 uploaded = st.sidebar.file_uploader(
     "Upload CSV or Excel",

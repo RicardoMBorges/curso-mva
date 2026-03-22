@@ -45,7 +45,7 @@ st.set_page_config(
 # LOGOs (optional)
 # -----------------------------
 STATIC_DIR = Path(__file__).parent / "static"
-for logo_name in ["LAABio.png"]: #"logo_massQL.png", 
+for logo_name in ["LAABio.png","MVA_Course.png"]: #"logo_massQL.png", 
     p = STATIC_DIR / logo_name
     try:
         from PIL import Image

@@ -3690,7 +3690,7 @@ with tabs[5]:
         }
         st.write(f"Accuracy: **{acc:.3f}**")
         st.write(f"Balanced accuracy: **{bacc:.3f}**")
-        with st.expander("Help — Accuracy vs Balanced Accuracy", expanded=False):
+        with st.expander("Help — Acurácia vs Acurácia balanceada", expanded=False):
             #st.markdown(PARAM_HELP["validation_accuracy"])
             st.markdown("---")
             st.markdown(PARAM_HELP["validation_balanced_accuracy"])

@@ -2583,162 +2583,167 @@ Se as curvas ainda estiverem muito separadas, isso pode indicar:
                     )
 
 # -------------------------
-# 2.5) Pre-PCA Projection (didactic)
+# 2.5) Projeção Pré-PCA (didática)
 # -------------------------
 with tabs[2]:
-    st.header("1.5) Pre-PCA Projection (Didactic)")
+    st.header("2.5) Projeção Pré-PCA (didática)")
     st.write(
         """
-A true **PCA score plot** needs PCA (eigenvectors / loadings) to be computed.
+Um verdadeiro **gráfico de escores de PCA** exige que a PCA
+(**autovetores / loadings**) seja efetivamente calculada.
 
-Here we do something didactic:
-- We show **arbitrary 2D projections** (before PCA) using:
-  - two chosen variables (Vx vs Vy), or
-  - simple constructed axes (sum / mean of variable subsets)
-- Then we show the **real PCA score plot** (after preprocessing, if available)
+Aqui fazemos algo didático:
+
+- Mostramos **projeções arbitrárias em 2D** (antes da PCA), usando:
+  - duas variáveis escolhidas (Vx vs Vy), ou
+  - eixos construídos de forma simples (soma / média de subconjuntos de variáveis)
+- Depois mostramos o **gráfico real de escores da PCA**
+  (após o pré-processamento, se disponível)
 """
     )
-    
+
     st.info(PARAM_HELP["pre_pca_projection"])
 
     if APP.raw is None or APP.X_cols is None or APP.X_raw is None or len(APP.X_cols) < 2:
-        st.info("Load data and map features first (Import tab). You need at least 2 numeric features.")
+        st.info("Carregue os dados e defina o mapeamento das variáveis primeiro (aba Importação). Você precisa de pelo menos 2 variáveis numéricas.")
         st.stop()
 
     df_full = APP.raw.copy()
     X_raw_df = _as_numeric_df(APP.X_raw.copy()).replace([np.inf, -np.inf], np.nan)
 
-    # NOTE: we don't rely on APP.meta for hover here; we attach hover fields directly from df_full.
-    # Keep meta only for the "true PCA" score plot (optional concat).
+    # NOTA: aqui não dependemos de APP.meta para hover;
+    # os campos de hover são anexados diretamente de df_full.
+    # meta é mantido apenas para o gráfico real de escores da PCA (concat opcional).
     meta = APP.meta.copy() if APP.meta is not None else pd.DataFrame(index=df_full.index)
     meta = meta.reset_index(drop=True)
     if meta.shape[0] != df_full.shape[0]:
         meta = pd.DataFrame({"row_index": np.arange(df_full.shape[0])})
 
     # ======================================================
-    # Controls
+    # Controles
     # ======================================================
-    st.subheader("Choose how to create the 'pre-PCA' 2D projection")
+    st.subheader("Escolha como criar a projeção 2D pré-PCA")
 
     mode = st.radio(
-        "Projection mode",
+        "Modo de projeção",
         [
-            "Two variables (feature vs feature)",
-            "Constructed axes (sum/mean of feature subsets)",
-            "Random 2D projection (linear combination)",
+            "Duas variáveis (variável vs variável)",
+            "Eixos construídos (soma/média de subconjuntos de variáveis)",
+            "Projeção 2D aleatória (combinação linear)",
         ],
         horizontal=True,
         key="pre_pca_mode",
     )
 
     st.divider()
-    st.subheader("Choose the data stage")
+    st.subheader("Escolha a etapa dos dados")
 
     stage = st.radio(
-        "Data stage",
-        ["RAW (as loaded)", "PRE-SCALE (after norm/transform/alignment)", "PROCESSED (after scaling)"],
+        "Etapa dos dados",
+        ["BRUTO (como carregado)", "PRÉ-SCALE (após normalização/transformação/alinhamento)", "PROCESSADO (após scaling)"],
         horizontal=True,
         key="pre_pca_stage",
         help=(
-            "RAW = original values (may differ in scale a lot). "
-            "PRE-SCALE = after preprocessing steps but before scaling. "
-            "PROCESSED = after scaling (same matrix used for PCA/modeling)."
+            "BRUTO = valores originais (podem diferir bastante em escala). "
+            "PRÉ-SCALE = após as etapas de pré-processamento, mas antes do scaling. "
+            "PROCESSADO = após o scaling (mesma matriz usada para PCA/modelagem)."
         ),
     )
 
     # ======================================================
-    # Pick matrix (ensure consistent row identity)
+    # Escolha da matriz (garantindo identidade consistente das linhas)
     # ======================================================
-    if stage.startswith("RAW"):
-        # RAW may contain NaN -> minimal impute so plots never crash
+    if stage.startswith("BRUTO"):
+        # Dados brutos podem conter NaN -> imputação mínima para evitar falha nos gráficos
         X_stage = X_raw_df.copy()
 
-        # ✅ critical: SimpleImputer drops all-NaN columns -> must pre-drop them
+        # ✅ crítico: SimpleImputer remove colunas totalmente NaN -> é preciso removê-las antes
         X_stage, dropped_all_nan = impute_df_safe(X_stage, strategy="median")
 
-        # Align index to df_full (same samples)
+        # Alinhar índice com df_full (mesmas amostras)
         X_stage = X_stage.reindex(index=df_full.index)
 
         if dropped_all_nan:
-            st.caption(f"RAW stage: dropped {len(dropped_all_nan)} all-NaN features before imputation.")
+            st.caption(f"Etapa BRUTA: {len(dropped_all_nan)} variáveis totalmente NaN foram removidas antes da imputação.")
 
-    elif stage.startswith("PRE-SCALE"):
+    elif stage.startswith("PRÉ-SCALE"):
         if APP.X_pre_scale is None:
-            st.warning("PRE-SCALE matrix not found. Run preprocessing first (tab 2).")
+            st.warning("Matriz PRÉ-SCALE não encontrada. Execute primeiro o pré-processamento (aba 2).")
             st.stop()
 
-        # APP.X_pre_scale is already your "final imputed, non-scaled" matrix from preprocessing.
-        # Keep it as-is to avoid re-imputing and subtly changing values again.
+        # APP.X_pre_scale já é a matriz final imputada e ainda sem scaling
+        # Mantemos como está para evitar nova imputação e alterações sutis
         X_stage = APP.X_pre_scale.copy()
         X_stage = X_stage.replace([np.inf, -np.inf], np.nan)
 
-        # Safety only (should rarely do anything if preprocessing is correct)
+        # Segurança adicional (raramente necessária, se o pré-processamento estiver correto)
         if X_stage.isna().any().any():
             X_stage = X_stage.fillna(X_stage.median(numeric_only=True))
 
-        # Ensure row index matches df_full
+        # Garantir que o índice corresponda a df_full
         X_stage = X_stage.reset_index(drop=True)
         X_stage.index = df_full.index
 
     else:
         if APP.X_proc is None or APP.feature_names is None:
-            st.warning("PROCESSED matrix not found. Run preprocessing first (tab 2).")
+            st.warning("Matriz PROCESSADA não encontrada. Execute primeiro o pré-processamento (aba 2).")
             st.stop()
 
-        # CRITICAL FIX: use df_full.index (not X_raw_df.index) to avoid shape/index mismatch crashes
+        # CRÍTICO: usar df_full.index (e não X_raw_df.index) para evitar incompatibilidades de forma/índice
         X_stage = pd.DataFrame(APP.X_proc, columns=APP.feature_names, index=df_full.index)
 
     feats = X_stage.columns.tolist()
 
-    # speed controls
+    # controles de velocidade
     st.divider()
-    fast_mode = st.checkbox("Fast mode", value=True, key="pre_pca_fast")
+    fast_mode = st.checkbox("Modo rápido", value=True, key="pre_pca_fast")
     max_points = 3000 if fast_mode else 10000
 
     # ======================================================
-    # Build "pre-PCA" 2D coordinates
+    # Construção das coordenadas 2D "pré-PCA"
     # ======================================================
     coords_df = pd.DataFrame(index=df_full.index)
 
-    if mode.startswith("Two variables"):
+    if mode.startswith("Duas variáveis"):
         c1, c2 = st.columns(2)
         with c1:
-            fx = st.selectbox("X feature", feats, index=0, key="pre_pca_fx")
+            fx = st.selectbox("Variável do eixo X", feats, index=0, key="pre_pca_fx")
         with c2:
-            fy = st.selectbox("Y feature", feats, index=1, key="pre_pca_fy")
+            fy = st.selectbox("Variável do eixo Y", feats, index=1, key="pre_pca_fy")
 
         coords_df["Axis 1"] = X_stage[fx].values
         coords_df["Axis 2"] = X_stage[fy].values
-        subtitle = f"Pre-PCA view = {fx} vs {fy}"
+        subtitle = f"Visualização pré-PCA = {fx} vs {fy}"
 
-    elif mode.startswith("Constructed axes"):
+    elif mode.startswith("Eixos construídos"):
         st.caption(
-            "We create two simple axes using feature subsets (not PCA):\n"
-            "- Axis 1 = mean (or sum) of subset A\n"
-            "- Axis 2 = mean (or sum) of subset B\n"
-            "This shows that dimensionality reduction can be done arbitrarily, but PCA does it optimally."
+            "Criamos dois eixos simples usando subconjuntos de variáveis (isso não é PCA):\n"
+            "- Eixo 1 = média (ou soma) do subconjunto A\n"
+            "- Eixo 2 = média (ou soma) do subconjunto B\n"
+            "Isso mostra que a redução de dimensionalidade pode ser feita de forma arbitrária, "
+            "mas a PCA escolhe a projeção de forma ótima."
         )
 
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
-            agg = st.selectbox("Aggregation", ["mean", "sum"], index=0, key="pre_pca_agg")
+            agg = st.selectbox("Agregação", ["mean", "sum"], index=0, key="pre_pca_agg")
         with c2:
-            kA = st.slider("Subset A size", 2, min(50, len(feats)), min(10, len(feats)), key="pre_pca_kA")
+            kA = st.slider("Tamanho do subconjunto A", 2, min(50, len(feats)), min(10, len(feats)), key="pre_pca_kA")
         with c3:
-            kB = st.slider("Subset B size", 2, min(50, len(feats)), min(10, len(feats)), key="pre_pca_kB")
+            kB = st.slider("Tamanho do subconjunto B", 2, min(50, len(feats)), min(10, len(feats)), key="pre_pca_kB")
 
         subset_mode = st.radio(
-            "Subset selection",
-            ["First features", "Random features (seeded)"],
+            "Seleção dos subconjuntos",
+            ["Primeiras variáveis", "Variáveis aleatórias (com seed)"],
             horizontal=True,
             key="pre_pca_subset_mode",
         )
 
-        if subset_mode.startswith("First"):
+        if subset_mode.startswith("Primeiras"):
             A = feats[:kA]
             B = feats[kA : kA + kB] if (kA + kB) <= len(feats) else feats[-kB:]
         else:
-            seed = st.number_input("Random seed", value=0, step=1, key="pre_pca_subset_seed")
+            seed = st.number_input("Seed aleatória", value=0, step=1, key="pre_pca_subset_seed")
             rng = np.random.default_rng(int(seed))
             pick = rng.choice(feats, size=min(kA + kB, len(feats)), replace=False).tolist()
             A = pick[:kA]
@@ -2751,20 +2756,21 @@ Here we do something didactic:
             coords_df["Axis 1"] = X_stage[A].sum(axis=1).values
             coords_df["Axis 2"] = X_stage[B].sum(axis=1).values
 
-        subtitle = f"Pre-PCA view = {agg}(subset A) vs {agg}(subset B)"
+        subtitle = f"Visualização pré-PCA = {agg}(subconjunto A) vs {agg}(subconjunto B)"
 
-        with st.expander("Show subsets used", expanded=False):
-            st.write("Subset A:", A)
-            st.write("Subset B:", B)
+        with st.expander("Mostrar subconjuntos utilizados", expanded=False):
+            st.write("Subconjunto A:", A)
+            st.write("Subconjunto B:", B)
 
     else:
         st.caption(
-            "Random 2D projection = linear combination of all features:\n"
-            "Axis 1 = X · w1, Axis 2 = X · w2 (random weights)\n"
-            "This is *not* PCA, but shows that 'projecting to 2D' is easy — PCA chooses the best projection."
+            "Projeção 2D aleatória = combinação linear de todas as variáveis:\n"
+            "Eixo 1 = X · w1, Eixo 2 = X · w2 (pesos aleatórios)\n"
+            "Isso *não* é PCA, mas mostra que projetar em 2D é fácil — "
+            "a PCA escolhe a melhor projeção."
         )
 
-        seed = st.number_input("Random seed", value=0, step=1, key="pre_pca_rand_seed")
+        seed = st.number_input("Seed aleatória", value=0, step=1, key="pre_pca_rand_seed")
         rng = np.random.default_rng(int(seed))
         W = rng.normal(size=(len(feats), 2))
         W = W / (np.linalg.norm(W, axis=0, keepdims=True) + 1e-12)
@@ -2772,9 +2778,9 @@ Here we do something didactic:
         Z = X_stage.values @ W
         coords_df["Axis 1"] = Z[:, 0]
         coords_df["Axis 2"] = Z[:, 1]
-        subtitle = "Pre-PCA view = random linear projection (2D)"
+        subtitle = "Visualização pré-PCA = projeção linear aleatória (2D)"
 
-    # Attach metadata for hover + color (from df_full, same row order/index)
+    # Anexar metadados para hover + cor (de df_full, mesma ordem/índice)
     if APP.id_col and APP.id_col in df_full.columns:
         coords_df[APP.id_col] = df_full[APP.id_col].astype(str).values
     if APP.y_col and APP.y_col in df_full.columns and APP.y_col not in coords_df.columns:
@@ -2784,19 +2790,19 @@ Here we do something didactic:
 
     hover_cols = [c for c in coords_df.columns if c not in ["Axis 1", "Axis 2"]]
 
-    # Optional downsampling for speed (keep hover_cols consistent)
+    # Redução opcional para acelerar a visualização
     n = coords_df.shape[0]
     if n > max_points:
         coords_df_plot = coords_df.sample(n=max_points, random_state=0)
-        st.caption(f"Showing {max_points} / {n} points (downsampled for speed).")
+        st.caption(f"Mostrando {max_points} / {n} pontos (reduzido para manter a responsividade).")
     else:
         coords_df_plot = coords_df.copy()
 
     # ======================================================
-    # Plot: pre-PCA projection
+    # Gráfico: projeção pré-PCA
     # ======================================================
     st.divider()
-    st.subheader("A) Pre-PCA projection (not a score plot)")
+    st.subheader("A) Projeção pré-PCA (não é um gráfico de escores)")
 
     fig_pre = px.scatter(
         coords_df_plot,
@@ -2804,20 +2810,20 @@ Here we do something didactic:
         y="Axis 2",
         color=(APP.color_col if (APP.color_col and APP.color_col in coords_df_plot.columns) else None),
         hover_data=[c for c in coords_df_plot.columns if c not in ["Axis 1", "Axis 2"]],
-        title=f"Pre-PCA 2D projection — {stage} — {subtitle}",
+        title=f"Projeção 2D pré-PCA — {stage} — {subtitle}",
     )
     fig_pre.update_layout(dragmode="zoom", height=520)
     st.plotly_chart(fig_pre, use_container_width=True, config={"displaylogo": False})
 
     key_pre = f"pre_pca_projection_{stage.replace(' ', '_').lower()}_{mode.split('(')[0].strip().replace(' ', '_').lower()}"
     store_fig(key_pre, fig_pre)
-    add_download_html_button(fig_pre, "Download HTML: pre-PCA projection", key_pre)
+    add_download_html_button(fig_pre, "Baixar HTML: projeção pré-PCA", key_pre)
 
     # ======================================================
-    # Plot: True PCA score plot (if available)
+    # Gráfico: verdadeiro score plot de PCA
     # ======================================================
     st.divider()
-    st.subheader("B) True PCA score plot (after PCA)")
+    st.subheader("B) Gráfico real de escores da PCA (após a PCA)")
 
     if APP.X_proc is None or APP.feature_names is None:
         st.info("Execute primeiro o **pré-processamento** para gerar a **matriz PROCESSADA**, e depois vá para **Exploração** para realizar a **PCA**.")
@@ -2826,11 +2832,11 @@ Here we do something didactic:
     Xp = APP.X_proc
     max_pca = min(10, Xp.shape[1])
     if max_pca < 2:
-        st.warning("Not enough features for PCA (need >=2).")
+        st.warning("Número insuficiente de variáveis para PCA (é necessário ≥ 2).")
         st.stop()
 
     n_comp = st.slider(
-        "PCA components (for this tab)",
+        "Componentes da PCA (nesta aba)",
         min_value=2,
         max_value=max_pca,
         value=min(3, max_pca),
@@ -2842,11 +2848,11 @@ Here we do something didactic:
 
     scores_df = pd.DataFrame(scores, columns=[f"PC{i+1}" for i in range(n_comp)])
 
-    # Optional metadata concat (already row-aligned by construction)
+    # Concatenação opcional de metadados (já alinhados por construção)
     if meta is not None and not meta.empty:
         scores_df = pd.concat([scores_df, meta.reset_index(drop=True)], axis=1)
 
-    # Ensure key hover/label columns exist
+    # Garantir colunas importantes para hover/rotulagem
     if APP.id_col and APP.id_col in df_full.columns and APP.id_col not in scores_df.columns:
         scores_df[APP.id_col] = df_full[APP.id_col].astype(str).values
     if APP.color_col and APP.color_col in df_full.columns and APP.color_col not in scores_df.columns:
@@ -2854,8 +2860,8 @@ Here we do something didactic:
     if APP.y_col and APP.y_col in df_full.columns and APP.y_col not in scores_df.columns:
         scores_df[APP.y_col] = df_full[APP.y_col].astype(str).values
 
-    pcx = st.selectbox("X axis (true PCA)", [f"PC{i+1}" for i in range(n_comp)], index=0, key="pre_pca_true_x")
-    pcy = st.selectbox("Y axis (true PCA)", [f"PC{i+1}" for i in range(n_comp)], index=1, key="pre_pca_true_y")
+    pcx = st.selectbox("Eixo X (PCA real)", [f"PC{i+1}" for i in range(n_comp)], index=0, key="pre_pca_true_x")
+    pcy = st.selectbox("Eixo Y (PCA real)", [f"PC{i+1}" for i in range(n_comp)], index=1, key="pre_pca_true_y")
 
     color_true = APP.color_col if (APP.color_col and APP.color_col in scores_df.columns) else None
     hover_true = [c for c in scores_df.columns if not c.startswith("PC")]
@@ -2866,75 +2872,75 @@ Here we do something didactic:
         y=pcy,
         color=color_true,
         hover_data=hover_true,
-        title=f"TRUE PCA scores (computed): {pcx} vs {pcy}",
+        title=f"Escores reais da PCA (calculados): {pcx} vs {pcy}",
     )
     fig_true.update_layout(dragmode="zoom", height=520)
     st.plotly_chart(fig_true, use_container_width=True, config={"displaylogo": False})
 
     key_true = "pre_pca_true_pca_scores"
     store_fig(key_true, fig_true)
-    add_download_html_button(fig_true, "Download HTML: true PCA scores", key_true)
+    add_download_html_button(fig_true, "Baixar HTML: escores reais da PCA", key_true)
 
-    # Explained variance
+    # Variância explicada
     evr = pca.explained_variance_ratio_ * 100.0
- 
+
     evr_df = pd.DataFrame({"PC": [f"PC{i+1}" for i in range(n_comp)], "Explained_%": evr})
-    fig_evr = px.bar(evr_df, x="PC", y="Explained_%", title="PCA explained variance (%) — (computed here)")
+    fig_evr = px.bar(evr_df, x="PC", y="Explained_%", title="Variância explicada pela PCA (%) — (calculada aqui)")
     st.plotly_chart(fig_evr, use_container_width=True, config={"displaylogo": False})
 
     key_evr = "pre_pca_true_pca_explained_variance"
     store_fig(key_evr, fig_evr)
-    add_download_html_button(fig_evr, "Download HTML: explained variance (this tab)", key_evr)
+    add_download_html_button(fig_evr, "Baixar HTML: variância explicada (nesta aba)", key_evr)
 
-    # Convenience ZIP download for this tab
+    # Download prático em ZIP desta aba
     st.divider()
-    st.subheader("Download this tab plots (ZIP of HTML)")
+    st.subheader("Baixar os gráficos desta aba (ZIP com HTML)")
     figs_local = {
         key_pre: fig_pre,
         key_true: fig_true,
         key_evr: fig_evr,
     }
     st.download_button(
-        "Download Pre-PCA tab plots (ZIP)",
+        "Baixar gráficos da aba Pré-PCA (ZIP)",
         data=zip_html(figs_local),
-        file_name="pre_pca_tab_plots_html.zip",
+        file_name="graficos_aba_pre_pca_html.zip",
         mime="application/zip",
         use_container_width=True,
     )
-    
+
     def pca_2d_step_by_step(X_stage: pd.DataFrame, fx: str, fy: str, eps: float = 1e-12):
         """
-        PCA geometry demo on 2 selected features.
-        Returns:
-          - df_raw: original coords
-          - df_cent: mean-centered coords
-          - eigvecs: 2x2 matrix (columns = PC1, PC2 directions in original space)
-          - df_rot: rotated coords (PC scores in 2D)
-          - evr: explained variance ratio (2,)
-          - mu: mean vector (2,)
+        Demonstração geométrica da PCA usando 2 variáveis selecionadas.
+        Retorna:
+          - df_raw: coordenadas originais
+          - df_cent: coordenadas centralizadas na média
+          - eigvecs: matriz 2x2 (colunas = direções de PC1 e PC2 no espaço original)
+          - df_rot: coordenadas rotacionadas (escores da PCA em 2D)
+          - evr: razão de variância explicada (2,)
+          - mu: vetor de médias (2,)
         """
         X2 = X_stage[[fx, fy]].copy()
         X2 = X2.replace([np.inf, -np.inf], np.nan)
 
-        # minimal impute just for this 2D demo
+        # imputação mínima apenas para esta demonstração 2D
         X2 = X2.fillna(X2.median(numeric_only=True))
 
         A = X2.to_numpy(dtype=float)                 # (n,2)
         mu = A.mean(axis=0)                          # (2,)
-        C = A - mu                                   # centered
+        C = A - mu                                   # centralizado
 
-        # Covariance (2x2)
+        # Covariância (2x2)
         cov = np.cov(C.T, bias=False)
 
-        # Eigen-decomposition (symmetric => eigh)
-        eigvals, eigvecs = np.linalg.eigh(cov)       # eigvecs columns
-        idx = np.argsort(eigvals)[::-1]              # descending
+        # Decomposição espectral (matriz simétrica => eigh)
+        eigvals, eigvecs = np.linalg.eigh(cov)       # colunas = autovetores
+        idx = np.argsort(eigvals)[::-1]              # ordem decrescente
         eigvals = eigvals[idx]
         eigvecs = eigvecs[:, idx]
 
         evr = eigvals / (eigvals.sum() + eps)
 
-        # Rotate: scores = C · eigvecs  (PC coordinates)
+        # Rotação: escores = C · eigvecs
         S = C @ eigvecs                               # (n,2)
 
         df_raw = pd.DataFrame(A, columns=[fx, fy], index=X2.index)
@@ -2943,27 +2949,26 @@ Here we do something didactic:
 
         return df_raw, df_cent, eigvecs, df_rot, evr, mu
 
-
     # -------------------------
-    # Inside your tab (after X_stage is defined)
+    # Dentro desta aba (após X_stage estar definido)
     # -------------------------
     st.divider()
-    st.subheader("C) PCA step-by-step (2 features only — geometric view)")
-    with st.expander("Show PCA geometry (mean-centering → PC axis → rotation)", expanded=False):
+    st.subheader("C) PCA passo a passo (apenas 2 variáveis — visão geométrica)")
+    with st.expander("Mostrar geometria da PCA (centralização na média → eixo da PC → rotação)", expanded=False):
 
         if len(feats) < 2:
-            st.info("Need at least 2 features.")
+            st.info("São necessárias pelo menos 2 variáveis.")
             st.stop()
 
         c1, c2 = st.columns(2)
         with c1:
-            fx_demo = st.selectbox("Feature X (demo)", feats, index=0, key="pca_demo_fx")
+            fx_demo = st.selectbox("Variável X (demonstração)", feats, index=0, key="pca_demo_fx")
         with c2:
-            fy_demo = st.selectbox("Feature Y (demo)", feats, index=1, key="pca_demo_fy")
+            fy_demo = st.selectbox("Variável Y (demonstração)", feats, index=1, key="pca_demo_fy")
 
         df_raw2, df_cent2, eigvecs, df_rot2, evr2, mu2 = pca_2d_step_by_step(X_stage, fx_demo, fy_demo)
 
-        # Attach class/color for plotting
+        # Anexar classe/cor para os gráficos
         color_col = None
         if APP.color_col and APP.color_col in df_full.columns:
             color_col = APP.color_col
@@ -2973,45 +2978,42 @@ Here we do something didactic:
             df_raw2.reset_index(drop=True).assign(**({color_col: df_full[color_col].astype(str).values} if color_col else {})),
             x=fx_demo, y=fy_demo,
             color=color_col,
-            title="A) Original 2D scatter (selected features)",
+            title="A) Dispersão 2D original (variáveis selecionadas)",
         )
         figA.update_layout(dragmode="zoom", height=420)
         st.plotly_chart(figA, use_container_width=True, config={"displaylogo": False})
 
-        # B) Mean-centered
+        # B) Centralizado na média
         xC, yC = f"{fx_demo}_centered", f"{fy_demo}_centered"
         figB = px.scatter(
             df_cent2.reset_index(drop=True).assign(**({color_col: df_full[color_col].astype(str).values} if color_col else {})),
             x=xC, y=yC,
             color=color_col,
-            title="B) Mean-centered scatter",
+            title="B) Dispersão após centralização na média",
         )
 
-        # C) Add PC1 axis line on centered plot
-        # direction of PC1 in original coords is eigvecs[:,0] in centered space too
+        # C) Adicionar linha do eixo PC1 ao gráfico centralizado
         v = eigvecs[:, 0]
-        # build a symmetric line around origin for visibility
         L = np.nanmax(np.abs(df_cent2[[xC, yC]].to_numpy())) * 1.2
         if not np.isfinite(L) or L <= 0:
             L = 1.0
         line_x = np.array([-L * v[0], L * v[0]])
         line_y = np.array([-L * v[1], L * v[1]])
-        figB.add_trace(go.Scatter(x=line_x, y=line_y, mode="lines", name="PC1 axis"))
+        figB.add_trace(go.Scatter(x=line_x, y=line_y, mode="lines", name="Eixo da PC1"))
 
         figB.update_layout(dragmode="zoom", height=420)
         st.plotly_chart(figB, use_container_width=True, config={"displaylogo": False})
-        st.caption(f"C) PC1 direction shown. Explained variance: PC1={evr2[0]*100:.1f}%, PC2={evr2[1]*100:.1f}%")
+        st.caption(f"C) Direção da PC1 mostrada. Variância explicada: PC1={evr2[0]*100:.1f}%, PC2={evr2[1]*100:.1f}%")
 
-        # D) Rotated coordinates (scores)
+        # D) Coordenadas rotacionadas (escores)
         figD = px.scatter(
             df_rot2.reset_index(drop=True).assign(**({color_col: df_full[color_col].astype(str).values} if color_col else {})),
             x="PC1", y="PC2",
             color=color_col,
-            title="D) Rotated axes: PCA scores for the 2-feature demo (PC1 vs PC2)",
+            title="D) Eixos rotacionados: escores da PCA para a demonstração com 2 variáveis (PC1 vs PC2)",
         )
         figD.update_layout(dragmode="zoom", height=420)
         st.plotly_chart(figD, use_container_width=True, config={"displaylogo": False})
-
 
 # -------------------------
 # 3) Exploration (PCA, correlations)

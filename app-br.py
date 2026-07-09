@@ -123,8 +123,8 @@ def impute_df_safe(
     if X2.shape[1] == 0:
         return X2, dropped
 
-    if strategy == "constante ":
-        imp = SimpleImputer(strategy="constante ", fill_value=fill_value)
+    if strategy == "constant":
+        imp = SimpleImputer(strategy="constant", fill_value=fill_value)
     else:
         imp = SimpleImputer(strategy=strategy)
 
@@ -320,12 +320,12 @@ def quantile_normalize_rows(X: pd.DataFrame) -> pd.DataFrame:
     sorted_vals = np.take_along_axis(A, order, axis=1)
 
     with np.errstate(invalid="ignore"):
-        média_sorted = np.nanmédia(sorted_vals, axis=0)
+        mean_sorted = np.nanmean(sorted_vals, axis=0)
 
-    média_sorted = np.where(np.isfinite(média_sorted), média_sorted, 0.0)
+    mean_sorted = np.where(np.isfinite(mean_sorted), mean_sorted, 0.0)
 
     out = np.empty_like(A)
-    np.put_along_axis(out, order, média_sorted[None, :], axis=1)
+    np.put_along_axis(out, order, mean_sorted[None, :], axis=1)
 
     return pd.DataFrame(out, index=X.index, columns=X.columns)
 
@@ -355,7 +355,7 @@ def scale_data(X: pd.DataFrame, method: str) -> pd.DataFrame:
 
     Xs = X.copy()
 
-    if method == "meanCenter":
+    if method == "MeanCenter":
         return Xs.apply(lambda col: col - col.mean(), axis=0)
 
     if method == "AutoScale":
@@ -423,8 +423,8 @@ def sample_normalize(
         Xn = Xn.mul(1000.0).div(s.replace(0, np.nan).values, axis=0)
         return Xn, None, msgs
 
-    if method == "medianaNorm":
-        m = Xn.mediana(axis=1, skipna=True)
+    if method == "MedianNorm":
+        m = Xn.median(axis=1, skipna=True)
         Xn = Xn.div(m.replace(0, np.nan).values, axis=0)
         return Xn, None, msgs
 
@@ -435,7 +435,7 @@ def sample_normalize(
         if ref.shape[0] != Xn.shape[1]:
             raise ValueError("Reference sample length must equal the number of features.")
         quot = Xn.div(ref.values, axis=1)
-        factors = quot.mediana(axis=1, skipna=True)
+        factors = quot.median(axis=1, skipna=True)
         Xn = Xn.div(factors.replace(0, np.nan).values, axis=0)
         return Xn, None, msgs
 
@@ -450,7 +450,7 @@ def sample_normalize(
             raise ValueError(f"Reference group '{ref_group}' was not found.")
         ref = Xn.loc[grp_idx].mean(axis=0)
         quot = Xn.div(ref.values, axis=1)
-        factors = quot.mediana(axis=1, skipna=True)
+        factors = quot.median(axis=1, skipna=True)
         Xn = Xn.div(factors.replace(0, np.nan).values, axis=0)
         return Xn, None, msgs
 
@@ -526,10 +526,10 @@ def batch_align(X: pd.DataFrame, batch: Optional[pd.Series], method: str) -> pd.
     Xc = X.copy()
 
     if method == "Center within batch (subtract batch média)":
-        return Xc - Xc.groupby(b).transform("média")
+        return Xc - Xc.groupby(b).transform("mean")
 
     if method == "Center within batch (subtract batch mediana)":
-        return Xc - Xc.groupby(b).transform("mediana")
+        return Xc - Xc.groupby(b).transform("median")
 
     raise ValueError(f"Unknown alignment method: {method}")
 
@@ -959,6 +959,350 @@ def build_detailed_report(app: AppData) -> str:
     lines.append("- Results depend on the selected preprocessing and validation settings")
 
     return "\n".join(lines)
+
+# -------------------------
+# PLS-DA validation helpers (MetaboAnalyst-like)
+# -------------------------
+def compute_plsda_validation(
+    X: np.ndarray,
+    y: pd.Series,
+    max_components: int,
+    cv_splits: int,
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    """
+    MetaboAnalyst-like PLS-DA validation.
+
+    Important implementation choices:
+    - No extra scaling is applied inside PLSRegression (scale=False), because this
+      portal receives an already processed/normalized matrix.
+    - Class labels are encoded as a dummy Y matrix.
+    - R2 is computed as fitted R2Y from the dummy-coded response matrix.
+    - Q2 is computed by cross-validated PRESS/SSY on the dummy-coded response matrix.
+    - Accuracy is computed from cross-validated class prediction using argmax(Y_pred).
+    """
+    X = np.asarray(X, dtype=float)
+    sample_ids = pd.Index(y.index.astype(str), name="SampleID")
+    y = y.astype(str).reset_index(drop=True)
+
+    if not np.all(np.isfinite(X)):
+        raise ValueError(
+            "The analysis matrix contains missing or non-finite values. "
+            "PLS-DA validation requires a complete analysis-ready matrix."
+        )
+
+    classes = sorted(y.unique().tolist())
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    y_idx = y.map(class_to_idx).to_numpy(dtype=int)
+
+    Y_df = pd.get_dummies(y)
+    Y_df = Y_df.reindex(columns=classes, fill_value=0)
+    Y = Y_df.to_numpy(dtype=float)
+
+    class_counts = y.value_counts()
+    if class_counts.min() < 2:
+        raise ValueError("Each class must have at least 2 samples for PLS-DA cross-validation.")
+
+    cv_splits_used = max(2, min(int(cv_splits), int(class_counts.min())))
+    max_components = max(1, min(int(max_components), X.shape[0] - 1, X.shape[1]))
+
+    cv = StratifiedKFold(
+        n_splits=cv_splits_used,
+        shuffle=True,
+        random_state=42,
+    )
+
+    rows = []
+    predictions_by_component: Dict[int, np.ndarray] = {}
+
+    ss_y_total = float(np.sum((Y - np.mean(Y, axis=0)) ** 2))
+
+    for ncomp in range(1, max_components + 1):
+        # Fit on the full dataset for R2Y.
+        pls_full = PLSRegression(n_components=ncomp, scale=False)
+        pls_full.fit(X, Y)
+        Y_fit = pls_full.predict(X)
+
+        ss_res_y = float(np.sum((Y - Y_fit) ** 2))
+        r2 = float("nan") if ss_y_total == 0 else 1.0 - (ss_res_y / ss_y_total)
+
+        # Cross-validated prediction for Q2 and accuracy.
+        Y_pred_all = np.zeros_like(Y, dtype=float)
+
+        for train_idx, test_idx in cv.split(X, y_idx):
+            X_train, X_test = X[train_idx], X[test_idx]
+            Y_train = Y[train_idx]
+
+            ncomp_fold = max(
+                1,
+                min(
+                    ncomp,
+                    X_train.shape[0] - 1,
+                    X_train.shape[1],
+                ),
+            )
+
+            pls_cv = PLSRegression(n_components=ncomp_fold, scale=False)
+            pls_cv.fit(X_train, Y_train)
+            Y_pred_all[test_idx, :] = pls_cv.predict(X_test)
+
+        press = float(np.sum((Y - Y_pred_all) ** 2))
+        q2 = float("nan") if ss_y_total == 0 else 1.0 - (press / ss_y_total)
+
+        pred_idx = np.argmax(Y_pred_all, axis=1)
+        pred_labels = np.array([classes[i] for i in pred_idx], dtype=object)
+        accuracy = float(np.mean(pred_idx == y_idx))
+        balanced_acc = float(balanced_accuracy_score(y.to_numpy(), pred_labels))
+
+        predictions_by_component[ncomp] = pred_labels
+
+        rows.append(
+            {
+                "Components": int(ncomp),
+                "Accuracy": accuracy,
+                "Balanced_accuracy": balanced_acc,
+                "R2": float(r2),
+                "Q2": float(q2),
+                "PRESS": float(press),
+                "SSY": float(ss_y_total),
+                "CV_folds": int(cv_splits_used),
+            }
+        )
+
+    metrics_df = pd.DataFrame(rows)
+
+    if metrics_df["Q2"].notna().any():
+        best_component = int(metrics_df.loc[metrics_df["Q2"].idxmax(), "Components"])
+    else:
+        best_component = int(metrics_df.loc[metrics_df["Accuracy"].idxmax(), "Components"])
+
+    best_pred = pd.Series(
+        predictions_by_component[best_component],
+        index=sample_ids,
+        name="Predicted_class",
+    )
+
+    pred_table = pd.DataFrame(
+        {
+            "SampleID": sample_ids.astype(str),
+            "True_class": y.values,
+            "Predicted_class": best_pred.values,
+            "Best_components": best_component,
+        }
+    )
+
+    return metrics_df, best_pred, pred_table
+
+
+def make_plsda_validation_plot(metrics_df: pd.DataFrame) -> go.Figure:
+    plot_df = metrics_df.melt(
+        id_vars="Components",
+        value_vars=["Accuracy", "R2", "Q2"],
+        var_name="Metric",
+        value_name="Performance",
+    )
+
+    fig = px.bar(
+        plot_df,
+        x="Components",
+        y="Performance",
+        color="Metric",
+        barmode="group",
+        title="PLS-DA validation by number of components",
+    )
+    fig.update_layout(
+        height=520,
+        yaxis_title="Performance",
+        xaxis_title="Number of components",
+        yaxis=dict(range=[min(-0.05, float(plot_df["Performance"].min()) if len(plot_df) else 0), 1.05]),
+    )
+    return fig
+
+
+def compute_plsda_permutation_test(
+    X: np.ndarray,
+    y: pd.Series,
+    observed_metrics_df: pd.DataFrame,
+    max_components: int,
+    cv_splits: int,
+    n_permutations: int = 100,
+    random_state: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Permutation test for PLS-DA validation.
+
+    Class labels are randomly permuted while X is kept unchanged. For each
+    permutation, the same PLS-DA validation workflow is executed and the best
+    component is selected by maximum Q2, matching the observed-model selection
+    rule used in the app. Empirical p-values are computed as:
+
+        p = (number of permuted metrics >= observed metric + 1) / (n + 1)
+
+    Smaller p-values indicate that the observed model performance is unlikely
+    to have arisen from random class assignment.
+    """
+    X = np.asarray(X, dtype=float)
+    y = y.astype(str).reset_index(drop=True)
+    n_permutations = int(max(1, n_permutations))
+
+    if observed_metrics_df.empty:
+        raise ValueError("Observed PLS-DA validation metrics are required before permutation testing.")
+
+    observed_best = observed_metrics_df.loc[observed_metrics_df["Q2"].idxmax()].copy()
+    observed = {
+        "Accuracy": float(observed_best["Accuracy"]),
+        "Balanced_accuracy": float(observed_best.get("Balanced_accuracy", np.nan)),
+        "R2": float(observed_best["R2"]),
+        "Q2": float(observed_best["Q2"]),
+        "Components": int(observed_best["Components"]),
+    }
+
+    rng = np.random.default_rng(int(random_state))
+    rows = []
+
+    for i in range(n_permutations):
+        y_perm = pd.Series(rng.permutation(y.values), index=y.index).astype(str)
+
+        perm_metrics_df, _, _ = compute_plsda_validation(
+            X,
+            y_perm,
+            max_components=max_components,
+            cv_splits=cv_splits,
+        )
+
+        if perm_metrics_df["Q2"].notna().any():
+            perm_best = perm_metrics_df.loc[perm_metrics_df["Q2"].idxmax()]
+        else:
+            perm_best = perm_metrics_df.loc[perm_metrics_df["Accuracy"].idxmax()]
+
+        rows.append(
+            {
+                "Permutation": i + 1,
+                "Components": int(perm_best["Components"]),
+                "Accuracy": float(perm_best["Accuracy"]),
+                "Balanced_accuracy": float(perm_best.get("Balanced_accuracy", np.nan)),
+                "R2": float(perm_best["R2"]),
+                "Q2": float(perm_best["Q2"]),
+            }
+        )
+
+    permutation_df = pd.DataFrame(rows)
+
+    summary_rows = []
+    for metric in ["Accuracy", "Balanced_accuracy", "R2", "Q2"]:
+        if metric not in permutation_df.columns or not np.isfinite(observed.get(metric, np.nan)):
+            continue
+        perm_vals = permutation_df[metric].replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+        if perm_vals.size == 0:
+            p_value = float("nan")
+        else:
+            p_value = float((np.sum(perm_vals >= float(observed[metric])) + 1) / (perm_vals.size + 1))
+        summary_rows.append(
+            {
+                "Metric": metric,
+                "Observed": float(observed[metric]),
+                "Permutation_mean": float(np.nanmean(perm_vals)) if perm_vals.size else float("nan"),
+                "Permutation_sd": float(np.nanstd(perm_vals, ddof=1)) if perm_vals.size > 1 else float("nan"),
+                "Empirical_p_value": p_value,
+                "N_permutations": int(n_permutations),
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    return permutation_df, summary_df
+
+
+def make_plsda_permutation_plot(
+    permutation_df: pd.DataFrame,
+    permutation_summary_df: pd.DataFrame,
+    metric: str = "Q2",
+) -> go.Figure:
+    """MetaboAnalyst-like histogram for one permutation statistic.
+
+    The histogram represents the null distribution obtained after random
+    permutation of class labels. The red arrow marks the observed statistic
+    from the original non-permuted model.
+    """
+    metric = str(metric)
+    if metric not in permutation_df.columns:
+        raise ValueError(f"Metric '{metric}' was not found in permutation results.")
+
+    obs_rows = permutation_summary_df.loc[permutation_summary_df["Metric"] == metric]
+    if obs_rows.empty:
+        raise ValueError(f"Observed statistic for metric '{metric}' was not found.")
+
+    perm_vals = (
+        permutation_df[metric]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .to_numpy(dtype=float)
+    )
+    obs = float(obs_rows.iloc[0]["Observed"])
+    pval = float(obs_rows.iloc[0]["Empirical_p_value"])
+    nperm = int(obs_rows.iloc[0]["N_permutations"])
+
+    if perm_vals.size == 0:
+        raise ValueError("No valid permutation values available for plotting.")
+
+    count_ge = int(np.sum(perm_vals >= obs))
+    min_x = float(np.nanmin(np.concatenate([perm_vals, np.array([obs])])))
+    max_x = float(np.nanmax(np.concatenate([perm_vals, np.array([obs])])))
+    x_pad = max((max_x - min_x) * 0.08, 1e-6)
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Histogram(
+            x=perm_vals,
+            nbinsx=min(50, max(10, int(np.sqrt(perm_vals.size)))),
+            name=f"Permuted {metric}",
+            marker=dict(color="rgba(80,80,80,0.85)", line=dict(color="black", width=0.5)),
+            opacity=0.95,
+        )
+    )
+
+    # Invisible trace only to estimate histogram max via client; annotation is
+    # placed in paper coordinates to avoid needing the histogram bin counts.
+    fig.add_vline(
+        x=obs,
+        line_width=3,
+        line_color="red",
+        line_dash="solid",
+    )
+
+    fig.add_annotation(
+        x=obs,
+        y=0.86,
+        xref="x",
+        yref="paper",
+        text=(
+            f"Observed statistic<br>"
+            f"{metric} = {obs:.3f}<br>"
+            f"p = {pval:.3f} ({count_ge + 1}/{nperm + 1})"
+        ),
+        showarrow=True,
+        arrowhead=3,
+        arrowsize=1.4,
+        arrowwidth=3,
+        arrowcolor="red",
+        ax=0,
+        ay=-95,
+        font=dict(size=14, color="black"),
+        bgcolor="rgba(255,255,255,0.85)",
+        bordercolor="rgba(0,0,0,0.25)",
+        borderwidth=1,
+    )
+
+    fig.update_layout(
+        title=f"PLS-DA permutation test — {metric}",
+        xaxis_title="Permutation test statistic",
+        yaxis_title="Frequency",
+        height=560,
+        showlegend=False,
+        bargap=0.02,
+        xaxis=dict(range=[min_x - x_pad, max_x + x_pad]),
+    )
+
+    return fig
+
 
 # -------------------------
 # Didactic text helpers
@@ -3311,19 +3655,21 @@ with tabs[4]:
                     help=PARAM_HELP["plsda_components"],
                 )
 
-            # Fit PLS
-            pls = PLSRegression(n_components=n_comp)
+            # -------------------------------------------------
+            # Ajuste PLS-DA no conjunto completo para visualização
+            # -------------------------------------------------
+            # Mesma lógica da versão em inglês / BioEspectra:
+            # Y dummy/one-hot + PLSRegression(scale=False).
+            pls = PLSRegression(n_components=n_comp, scale=False)
             pls.fit(X, Y)
 
-            # Scores (T): sample coordinates in LV space
-            T = pls.x_scores_  # shape (n_samples, n_comp)
+            # Scores (T): coordenadas das amostras no espaço latente
+            T = pls.x_scores_
 
             scores_df = pd.DataFrame(T, columns=[f"LV{i+1}" for i in range(n_comp)])
-            scores_df["class"] = y
+            scores_df["classe"] = y
 
-            # Add SampleID if available (nice for hover)
             if APP.raw is not None and APP.id_col and APP.id_col in APP.raw.columns:
-                # Align indices: use same mask used above
                 sample_ids = APP.raw.loc[mask.values, APP.id_col].astype(str).values
                 scores_df[APP.id_col] = sample_ids
 
@@ -3332,162 +3678,118 @@ with tabs[4]:
             c1, c2 = st.columns([2, 1])
 
             with c1:
-                lvx = st.selectbox("X axis", [f"LV{i+1}" for i in range(n_comp)], index=0, key="plsda_lvx")
-                lvy = st.selectbox("Y axis", [f"LV{i+1}" for i in range(n_comp)], index=1, key="plsda_lvy")
-            
+                lvx = st.selectbox("Eixo X", [f"LV{i+1}" for i in range(n_comp)], index=0, key="plsda_lvx")
+                lvy = st.selectbox("Eixo Y", [f"LV{i+1}" for i in range(n_comp)], index=1, key="plsda_lvy")
+
                 show_pls_ellipse = st.checkbox(
-                    "Show 95% confidence ellipse",
+                    "Mostrar elipse de confiança de 95%",
                     value=True,
                     key="plsda_score_ellipse",
                 )
-            
+
                 pls_group_color_map = None
-                if "class" in scores_df.columns:
-                    groups_sorted = sorted(scores_df["class"].dropna().astype(str).unique().tolist())
-                    palette = px.colors.qualitative.Plotly
-                    pls_group_color_map = {
-                        grp: palette[i % len(palette)]
-                        for i, grp in enumerate(groups_sorted)
-                    }
-            
+                groups_sorted = sorted(scores_df["classe"].dropna().astype(str).unique().tolist())
+                palette = px.colors.qualitative.Plotly
+                pls_group_color_map = {grp: palette[i % len(palette)] for i, grp in enumerate(groups_sorted)}
+
                 fig_pls_scores = px.scatter(
                     scores_df,
                     x=lvx,
                     y=lvy,
-                    color="class",
+                    color="classe",
                     hover_data=hover_cols,
-                    title=f"PLS-DA Scores: {lvx} vs {lvy}",
-                    color_discrete_map=pls_group_color_map if pls_group_color_map is not None else None,
+                    title=f"Scores de PLS-DA: {lvx} vs {lvy}",
+                    color_discrete_map=pls_group_color_map,
                 )
-            
                 fig_pls_scores.update_traces(marker=dict(size=9, line=dict(width=0)))
-            
+
                 if show_pls_ellipse:
                     fig_pls_scores = add_confidence_ellipse_to_fig(
                         fig_pls_scores,
                         scores_df,
                         x_col=lvx,
                         y_col=lvy,
-                        group_col="class",
+                        group_col="classe",
                         level=0.95,
                         color_map=pls_group_color_map,
                     )
-            
+
                 fig_pls_scores.update_layout(dragmode="zoom")
                 st.plotly_chart(fig_pls_scores, use_container_width=True, config={"displaylogo": False})
-            
+
                 key = "model_plsda_scores"
                 store_fig(key, fig_pls_scores)
-                add_download_html_button(fig_pls_scores, "Download HTML: PLS-DA scores", key)
+                add_download_html_button(fig_pls_scores, "Download HTML: scores PLS-DA", key)
                 figs_local[key] = fig_pls_scores
 
             with c2:
-                # Simple proxy: fraction of X variance captured per component
-                # (PLS doesn't expose "explained variance" exactly like PCA; this is didactic)
-                X_hat = pls.x_scores_ @ pls.x_loadings_.T
-                ss_total = np.sum(X ** 2)
-                ss_res = np.sum((X - X_hat) ** 2)
-                r2x = 1.0 - (ss_res / ss_total) if ss_total > 0 else np.nan
-                st.metric("R²X (overall, approx.)", f"{r2x:.3f}" if np.isfinite(r2x) else "NA")
-
-                # Also show class distribution for context
                 st.write("Classes:", classes)
+                st.markdown("**Validação PLS-DA nesta aba**")
+                st.caption(
+                    "R² e Q² são calculados pela mesma rotina da aba Validação: "
+                    "Y dummy, PLSRegression(scale=False), PRESS/SSY e validação cruzada estratificada."
+                )
 
-                # -------------------------------------------------
-                # What is Q²? (didactic dropdown explanation)
-                # -------------------------------------------------
-                with st.expander("O que é Q² (capacidade preditiva avaliada por validação cruzada)?", expanded=False):
-                
-                    st.markdown("""
-**Q² mede o quão bem o modelo prevê amostras que não foram usadas no ajuste do modelo.**
-
-Diferentemente do **R²**, que mede o quão bem o modelo se ajusta aos **dados de treinamento**,  
-o **Q² avalia o desempenho preditivo usando validação cruzada**.
-
-### Conceito
-
-1. O conjunto de dados é dividido em vários **folds**.
-2. O modelo é treinado com uma parte dos dados.
-3. São feitas previsões para as amostras que ficaram de fora.
-4. Os **erros de predição são acumulados**.
-
-### Interpretação
-
-| Valor de Q² | Significado |
-|--------------|-------------|
-| < 0 | o modelo prevê pior do que a média (**overfitting**) |
-| 0 – 0.3 | baixo poder preditivo |
-| 0.3 – 0.5 | capacidade preditiva moderada |
-| > 0.5 | bom modelo preditivo |
-                """)
-             
-                # -----------------------------
-                # Q² (cross-validated predictive ability)
-                # -----------------------------
-
-                st.subheader("Q² validado por validação cruzada",    help="Q² mede o quão bem o modelo prevê novos dados, geralmente utilizando validação cruzada.")
-
-                # CV parameters
-                cv_folds = st.slider(
-                    "Folds for Q²",
+                cv_folds_model = st.slider(
+                    "Folds da validação PLS-DA",
                     min_value=2,
                     max_value=max_allowed_folds,
                     value=min(5, max_allowed_folds),
-                    key="plsda_q2_folds",
+                    key="plsda_model_cv_folds",
                 )
 
-                cv_repeats = st.slider(
-                    "Repeats for Q²",
-                    min_value=1,
-                    max_value=20,
-                    value=3,
-                    key="plsda_q2_repeats",
-                )
-
-                seed = st.number_input("Random seed (Q²)", value=0, step=1, key="plsda_q2_seed")
-
-                from sklearn.model_selection import StratifiedKFold
-
-                Y_true_all = []
-                Y_pred_all = []
-
-                for r in range(cv_repeats):
-                    cv = StratifiedKFold(
-                        n_splits=cv_folds,
-                        shuffle=True,
-                        random_state=int(seed) + r
+                try:
+                    y_for_validation = pd.Series(
+                        y,
+                        index=pd.Index([str(i) for i in range(len(y))], name="SampleID"),
                     )
+                    metrics_model_df, best_pred_model, pred_table_model = compute_plsda_validation(
+                        X=X,
+                        y=y_for_validation,
+                        max_components=n_comp,
+                        cv_splits=cv_folds_model,
+                    )
+                    model_row = metrics_model_df.loc[metrics_model_df["Components"] == n_comp].iloc[0]
 
-                    for train_idx, test_idx in cv.split(X, y):
-                        pls_cv = PLSRegression(n_components=n_comp)
-                        pls_cv.fit(X[train_idx], Y[train_idx])
+                    m1, m2 = st.columns(2)
+                    m1.metric("R²", f"{float(model_row['R2']):.3f}")
+                    m2.metric("Q²", f"{float(model_row['Q2']):.3f}")
+                    m3, m4 = st.columns(2)
+                    m3.metric("Acurácia", f"{float(model_row['Accuracy']):.3f}")
+                    m4.metric("Acurácia balanceada", f"{float(model_row['Balanced_accuracy']):.3f}")
 
-                        Y_pred = pls_cv.predict(X[test_idx])
+                    with st.expander("Como estes R² e Q² são calculados?", expanded=False):
+                        st.markdown("""
+Nesta versão, a aba **Modelagem** usa o mesmo cálculo da aba **Validação**.
 
-                        Y_true_all.append(Y[test_idx])
-                        Y_pred_all.append(Y_pred)
+- **Y** é convertido em uma matriz dummy/one-hot das classes.
+- O modelo é ajustado como `PLSRegression(scale=False)`.
+- **R²** é calculado como ajuste do modelo à matriz dummy de classes no conjunto completo.
+- **Q²** é calculado por validação cruzada estratificada usando `PRESS/SSY`.
+- A classe prevista é definida pelo maior valor predito em `Y_pred`.
 
-                Y_true_all = np.vstack(Y_true_all)
-                Y_pred_all = np.vstack(Y_pred_all)
+Assim, esta aba não usa mais o cálculo antigo baseado em `Y_true_all` repetido e média global dos folds.
+                        """)
 
-                # Compute Q²
-                PRESS = np.sum((Y_true_all - Y_pred_all) ** 2)
-                TSS = np.sum((Y_true_all - np.mean(Y_true_all, axis=0)) ** 2)
+                    with st.expander("Tabela de validação por componente até o componente selecionado", expanded=False):
+                        st.dataframe(metrics_model_df, use_container_width=True)
 
-                Q2 = 1.0 - PRESS / TSS if TSS > 0 else np.nan
+                except Exception as e:
+                    st.warning(f"Não foi possível calcular R²/Q² pela rotina atual de validação PLS-DA: {e}")
+                    metrics_model_df = pd.DataFrame()
+                    model_row = None
 
-                st.metric("Q² (cross-validated)", f"{Q2:.3f}")
-             
             APP.model_params = {
-                "model_kind": "PLS-DA (PLSRegression on one-hot y)",
+                "model_kind": "PLS-DA (PLSRegression com y dummy/one-hot; scale=False)",
                 "n_components": int(n_comp),
                 "classes": classes,
                 "n_samples": int(X.shape[0]),
                 "n_features": int(X.shape[1]),
-                "q2_folds": int(cv_folds),
-                "q2_repeats": int(cv_repeats),
-                "q2_seed": int(seed),
-                "Q2": float(Q2) if np.isfinite(Q2) else None,
+                "cv_folds_modeling_tab": int(cv_folds_model),
+                "R2": float(model_row["R2"]) if model_row is not None and np.isfinite(float(model_row["R2"])) else None,
+                "Q2": float(model_row["Q2"]) if model_row is not None and np.isfinite(float(model_row["Q2"])) else None,
+                "Accuracy": float(model_row["Accuracy"]) if model_row is not None and np.isfinite(float(model_row["Accuracy"])) else None,
+                "Balanced_accuracy": float(model_row["Balanced_accuracy"]) if model_row is not None and np.isfinite(float(model_row["Balanced_accuracy"])) else None,
             }
 
             st.divider()
@@ -3586,226 +3888,296 @@ o **Q² avalia o desempenho preditivo usando validação cruzada**.
             )
 
 # -------------------------
-# 5) Validation (CV + confusion + ROC)
+# 5) Validação PLS-DA (MetaboAnalyst-like)
 # -------------------------
 with tabs[5]:
     st.header("5) Validação")
+
     with st.expander("Qual é o objetivo da validação?", expanded=False):
         st.markdown(PARAM_HELP["validation_cv_overview"])
-    
-    with st.expander("Como funciona a validação cruzada?", expanded=False):
-        st.markdown(PARAM_HELP["validation_cv_overview"])
+
+    with st.expander("Como interpretar R², Q² e acurácia nesta validação PLS-DA?", expanded=False):
+        st.markdown(
+            """
+Esta seção usa a mesma lógica implementada no app seguro de devolutiva da BioEspectra.
+
+**O que é calculado:**
+
+- **R²**: ajuste do modelo PLS-DA à matriz de resposta dummy das classes.
+- **Q²**: capacidade preditiva estimada por validação cruzada, usando PRESS/SSY na matriz dummy das classes.
+- **Acurácia**: proporção de amostras corretamente classificadas na validação cruzada.
+- **Acurácia balanceada**: média do desempenho por classe, útil quando há desbalanceamento.
+
+**Importante:**
+
+Esta implementação é uma aproximação do fluxo do MetaboAnalyst usando `PLSRegression(scale=False)` do scikit-learn.  
+Ela foi estruturada para reproduzir a lógica geral de validação PLS-DA por componentes, incluindo seleção do melhor número de componentes por maior Q² e teste de permutação.
+            """
+        )
 
     if APP.X_proc is None:
         st.info("Execute primeiro o pré-processamento.")
     elif APP.y_raw is None:
-        st.warning("No target y selected.")
+        st.warning("É necessário selecionar uma coluna/linha de classe para validar o modelo.")
     else:
-        # -------------------------
-        # Data
-        # -------------------------
-        y_ser = APP.y_raw
+        y_ser = APP.y_raw.copy()
         mask = ~pd.isna(y_ser)
-        X = APP.X_proc[mask.values, :]
-        y = y_ser[mask].astype(str).values
+        X = np.asarray(APP.X_proc[mask.values, :], dtype=float)
+        y = y_ser[mask].astype(str).reset_index(drop=True)
 
-        # Stable class order
-        classes = np.array(sorted(pd.unique(y).tolist()))
+        if APP.raw is not None and APP.id_col and APP.id_col in APP.raw.columns:
+            y.index = APP.raw.loc[mask.values, APP.id_col].astype(str).values
 
-        # Folds allowed by smallest class
-        class_counts = pd.Series(y).value_counts()
-        min_class_n = int(class_counts.min()) if len(class_counts) else 0
-        if min_class_n < 2:
-            st.error(f"Not enough samples per class for CV. Counts: {class_counts.to_dict()}")
+        classes = sorted(pd.unique(y.astype(str)).tolist())
+        class_counts = y.value_counts()
+
+        if class_counts.min() < 2:
+            st.error(f"A validação cruzada PLS-DA requer pelo menos 2 amostras por classe. Contagens: {class_counts.to_dict()}")
             st.stop()
 
-        max_allowed_folds = min(10, min_class_n)
-        st.caption(f"Class counts: {class_counts.to_dict()} | max folds allowed: {max_allowed_folds}")
+        max_allowed_folds = min(10, int(class_counts.min()))
+        max_components_allowed = max(1, min(X.shape[0] - 1, X.shape[1]))
 
-        # -------------------------
-        # CV controls
-        # -------------------------
-        st.subheader("Validação cruzada")
-        with st.expander("Help — Cross-validation settings", expanded=False):
-            st.markdown(PARAM_HELP["validation_cv_overview"])
-            st.markdown(PARAM_HELP["validation_repeats"])
-         
-        cv_folds = st.slider(
-            "Folds",
-            min_value=2,
-            max_value=max_allowed_folds,
-            value=min(5, max_allowed_folds),
-            key="val_folds",
-            #help=f"Max allowed folds: {max_allowed_folds} (min class size = {min_class_n})",
-            help=PARAM_HELP["cv_folds"],
+        st.caption(
+            f"Classes: {classes} | Contagens por classe: {class_counts.to_dict()} | "
+            f"máximo de folds permitido: {max_allowed_folds}"
         )
-        n_repeats = st.slider("Repeats", 1, 20, 3, key="val_repeats",help=PARAM_HELP["cv_repeats"])
-        seed = st.number_input("Random seed", value=0, step=1, key="val_seed")
 
-        # Model controls
-        C = st.slider("C (LogReg)", 0.01, 10.0, 1.0, key="val_C")
-        max_iter = st.slider("max_iter", 100, 5000, 1000, step=100, key="val_max_iter")
-        model = LogisticRegression(C=C, max_iter=max_iter, solver="lbfgs")
+        st.subheader("Parâmetros da validação PLS-DA")
 
-        # -------------------------
-        # Repeated CV predictions
-        # -------------------------
-        y_true_all: List[np.ndarray] = []
-        y_pred_all: List[np.ndarray] = []
-        y_proba_all: List[np.ndarray] = []
-
-        for r in range(int(n_repeats)):
-            cv = StratifiedKFold(
-                n_splits=int(cv_folds),
-                shuffle=True,
-                random_state=int(seed) + r,
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            max_components = st.slider(
+                "Número máximo de componentes PLS-DA",
+                min_value=1,
+                max_value=max_components_allowed,
+                value=min(5, max_components_allowed),
+                key="plsda_val_max_components_br",
+                help="A validação testa todos os componentes de 1 até este valor.",
+            )
+        with c2:
+            cv_folds = st.slider(
+                "Folds da validação cruzada",
+                min_value=2,
+                max_value=max_allowed_folds,
+                value=min(5, max_allowed_folds),
+                key="plsda_val_cv_folds_br",
+                help=PARAM_HELP["cv_folds"],
+            )
+        with c3:
+            run_permutation = st.checkbox(
+                "Executar teste de permutação",
+                value=False,
+                key="plsda_run_permutation_br",
             )
 
-            y_pred = cross_val_predict(model, X, y, cv=cv, method="predict")
-            y_true_all.append(y)
-            y_pred_all.append(y_pred)
+        if not np.all(np.isfinite(X)):
+            st.error(
+                "A matriz contém valores ausentes ou não finitos. "
+                "Execute/impute o pré-processamento antes da validação PLS-DA."
+            )
+            st.stop()
 
-            # Probabilities only when available
-            try:
-                y_proba = cross_val_predict(model, X, y, cv=cv, method="predict_proba")
-                y_proba_all.append(y_proba)
-            except Exception:
-                pass
+        try:
+            metrics_df, best_pred, pred_table = compute_plsda_validation(
+                X=X,
+                y=y,
+                max_components=int(max_components),
+                cv_splits=int(cv_folds),
+            )
+        except Exception as e:
+            st.error(f"Falha na validação PLS-DA: {e}")
+            st.stop()
 
-        y_true = np.concatenate(y_true_all)
-        y_pred = np.concatenate(y_pred_all)
+        if metrics_df["Q2"].notna().any():
+            best_row = metrics_df.loc[metrics_df["Q2"].idxmax()].copy()
+        else:
+            best_row = metrics_df.loc[metrics_df["Accuracy"].idxmax()].copy()
 
-        acc = accuracy_score(y_true, y_pred)
-        bacc = balanced_accuracy_score(y_true, y_pred)
+        best_components = int(best_row["Components"])
+        y_true = pred_table["True_class"].astype(str).to_numpy()
+        y_pred = pred_table["Predicted_class"].astype(str).to_numpy()
+        classes_arr = np.array(classes)
+
+        st.subheader("Resumo da validação")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Melhor nº de componentes", str(best_components))
+        m2.metric("Acurácia", f"{float(best_row['Accuracy']):.3f}")
+        m3.metric("R²", f"{float(best_row['R2']):.3f}")
+        m4.metric("Q²", f"{float(best_row['Q2']):.3f}")
+
+        with st.expander("Tabela completa da validação por componente", expanded=False):
+            st.dataframe(metrics_df, use_container_width=True)
+
+        fig_val = make_plsda_validation_plot(metrics_df)
+        fig_val.update_layout(title="Validação PLS-DA por número de componentes")
+        st.plotly_chart(fig_val, use_container_width=True, config={"displaylogo": False})
+        store_fig("plsda_validation_by_components", fig_val)
+        add_download_html_button(fig_val, "Download HTML: validação PLS-DA", "plsda_validation_by_components")
+
+        figs_local = {"plsda_validation_by_components": fig_val}
+
         APP.validation_params = {
-            "validation_model": "Logistic Regression",
+            "validation_model": "PLS-DA — MetaboAnalyst-like dummy-Y validation",
             "cv_folds": int(cv_folds),
-            "cv_repeats": int(n_repeats),
-            "random_seed": int(seed),
-            "C": float(C),
-            "max_iter": int(max_iter),
-            "accuracy": float(acc),
-            "balanced_accuracy": float(bacc),
-            "classes": classes.tolist(),
+            "max_components": int(max_components),
+            "best_components": int(best_components),
+            "accuracy": float(best_row["Accuracy"]),
+            "balanced_accuracy": float(best_row.get("Balanced_accuracy", np.nan)),
+            "R2": float(best_row["R2"]),
+            "Q2": float(best_row["Q2"]),
+            "classes": classes,
         }
-        st.write(f"Accuracy: **{acc:.3f}**")
-        st.write(f"Balanced accuracy: **{bacc:.3f}**")
-        with st.expander("Help — Acurácia vs Acurácia balanceada", expanded=False):
-            #st.markdown(PARAM_HELP["validation_accuracy"])
-            st.markdown("---")
-            st.markdown(PARAM_HELP["validation_balanced_accuracy"])
 
-        # -------------------------
-        # Confusion matrix
-        # -------------------------
         st.divider()
         st.subheader("Matriz de confusão")
-     
-        with st.expander("Help — Como ler a Matriz de confusão", expanded=False):
+        with st.expander("Ajuda — Como ler a matriz de confusão", expanded=False):
             st.markdown(PARAM_HELP["validation_confusion_matrix"])
 
-
-        cm = confusion_matrix(y_true, y_pred, labels=classes)
+        cm = confusion_matrix(y_true, y_pred, labels=classes_arr)
         cm_df = pd.DataFrame(
             cm,
-            index=[f"true:{c}" for c in classes],
-            columns=[f"pred:{c}" for c in classes],
+            index=[f"real:{c}" for c in classes_arr],
+            columns=[f"predito:{c}" for c in classes_arr],
         )
-        fig_cm = px.imshow(cm_df, text_auto=True, aspect="auto", title="Matriz de confusão (validação cruzada repetida)")
+        fig_cm = px.imshow(
+            cm_df,
+            text_auto=True,
+            aspect="auto",
+            title=f"Matriz de confusão — PLS-DA CV ({best_components} componente(s))",
+        )
         st.plotly_chart(fig_cm, use_container_width=True, config={"displaylogo": False})
-        store_fig("validation_confusion_matrix", fig_cm)
-        add_download_html_button(fig_cm, "Download HTML: confusion matrix", "validation_confusion_matrix")
+        store_fig("plsda_validation_confusion_matrix", fig_cm)
+        add_download_html_button(fig_cm, "Download HTML: matriz de confusão", "plsda_validation_confusion_matrix")
+        figs_local["plsda_validation_confusion_matrix"] = fig_cm
 
-        # -------------------------
-        # ROC (binary only)
-        # -------------------------
+        with st.expander("Tabela de predições por amostra", expanded=False):
+            st.dataframe(pred_table, use_container_width=True)
+            st.download_button(
+                "Download tabela de predições (CSV)",
+                data=pred_table.to_csv(index=False).encode("utf-8"),
+                file_name="plsda_cv_predictions.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
         st.divider()
-        st.subheader("ROC (apenas para classificação binária)")
-     
-        with st.expander("Help — Curva ROC e AUC", expanded=False):
+        st.subheader("Relatório de classificação")
+        with st.expander("Ajuda — Relatório de classificação", expanded=False):
+            st.markdown(PARAM_HELP["validation_classification_report"])
+        st.code(classification_report(y_true, y_pred), language="text")
+
+        st.divider()
+        st.subheader("ROC (apenas classificação binária)")
+        with st.expander("Ajuda — Curva ROC e AUC", expanded=False):
             st.markdown(PARAM_HELP["validation_roc"])
 
-        figs_local = {"validation_confusion_matrix": fig_cm}
+        if len(classes_arr) == 2:
+            # Recalcular os scores contínuos CV para o melhor componente para construir ROC.
+            Y_df = pd.get_dummies(y.astype(str)).reindex(columns=list(classes_arr), fill_value=0)
+            Y = Y_df.to_numpy(dtype=float)
+            y_idx = y.astype(str).map({c: i for i, c in enumerate(classes_arr)}).to_numpy(dtype=int)
+            cv = StratifiedKFold(n_splits=int(cv_folds), shuffle=True, random_state=42)
+            Y_pred_all = np.zeros_like(Y, dtype=float)
 
-        if len(classes) == 2 and len(y_proba_all) > 0:
-            # Stack probabilities from the repeats that actually produced them
-            proba = np.vstack(y_proba_all)
+            for train_idx, test_idx in cv.split(X, y_idx):
+                ncomp_fold = max(1, min(best_components, X[train_idx].shape[0] - 1, X[train_idx].shape[1]))
+                pls_cv = PLSRegression(n_components=ncomp_fold, scale=False)
+                pls_cv.fit(X[train_idx], Y[train_idx])
+                Y_pred_all[test_idx, :] = pls_cv.predict(X[test_idx])
 
-            # y order from cross_val_predict is aligned to the input y each time
-            y_true_for_proba = np.tile(y, len(y_proba_all))
+            pos_label = st.selectbox(
+                "Classe positiva",
+                options=list(classes_arr),
+                index=1,
+                key="plsda_val_pos_label_br",
+            )
+            pos_idx = int(np.where(classes_arr == pos_label)[0][0])
+            y_bin = (y.astype(str).to_numpy() == str(pos_label)).astype(int)
+            y_score = Y_pred_all[:, pos_idx]
+            auc = roc_auc_score(y_bin, y_score)
+            fpr, tpr, _ = roc_curve(y_bin, y_score)
 
-            # Sanity check: rows must match
-            if proba.shape[0] != y_true_for_proba.shape[0]:
-                st.warning("ROC skipped: probability rows do not match y_true length.")
-            else:
-                # IMPORTANT: get the true probability-column order from the estimator
-                model_tmp = LogisticRegression(C=C, max_iter=max_iter, solver="lbfgs")
-                model_tmp.fit(X, y)
-                proba_classes = model_tmp.classes_  # column order used by predict_proba
+            APP.validation_params["positive_class"] = str(pos_label)
+            APP.validation_params["roc_auc"] = float(auc)
 
-                # Guard: ensure proba columns match the estimator's class order
-                if proba.shape[1] != len(proba_classes):
-                    st.warning("ROC skipped: probability output shape does not match class list.")
-                else:
-                    with st.expander("Help — Choosing the positive class", expanded=False):
-                        st.markdown(PARAM_HELP["validation_positive_class"])
-                    pos_label = st.selectbox(
-                        "Positive class",
-                        options=list(proba_classes),
-                        index=1,
-                        key="val_pos_label",
-                    )
-                    pos_idx = int(np.where(proba_classes == pos_label)[0][0])
-
-                    y_bin = (y_true_for_proba == pos_label).astype(int)
-                    y_score = proba[:, pos_idx]
-
-                    auc = roc_auc_score(y_bin, y_score)
-                    APP.validation_params["positive_class"] = str(pos_label)
-                    APP.validation_params["roc_auc"] = float(auc)
-                    fpr, tpr, _ = roc_curve(y_bin, y_score)
-
-                    fig_roc = go.Figure()
-                    fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
-                    fig_roc.add_trace(
-                        go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Chance", line=dict(dash="dash"))
-                    )
-                    fig_roc.update_layout(
-                        title="ROC Curve (Repeated CV)",
-                        xaxis_title="False Positive Rate",
-                        yaxis_title="True Positive Rate",
-                        dragmode="zoom",
-                    )
-
-                    st.plotly_chart(fig_roc, use_container_width=True, config={"displaylogo": False})
-                    store_fig("validation_roc", fig_roc)
-                    add_download_html_button(fig_roc, "Download HTML: ROC curve", "validation_roc")
-                    figs_local["validation_roc"] = fig_roc
+            fig_roc = go.Figure()
+            fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"ROC (AUC={auc:.3f})"))
+            fig_roc.add_trace(
+                go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Acaso", line=dict(dash="dash"))
+            )
+            fig_roc.update_layout(
+                title="Curva ROC — PLS-DA CV",
+                xaxis_title="Taxa de falsos positivos",
+                yaxis_title="Taxa de verdadeiros positivos",
+                dragmode="zoom",
+            )
+            st.plotly_chart(fig_roc, use_container_width=True, config={"displaylogo": False})
+            store_fig("plsda_validation_roc", fig_roc)
+            add_download_html_button(fig_roc, "Download HTML: curva ROC", "plsda_validation_roc")
+            figs_local["plsda_validation_roc"] = fig_roc
         else:
-            st.info("ROC is shown only for binary targets with probability predictions.")
+            st.info("A curva ROC é exibida apenas para alvos binários.")
 
+        if run_permutation:
+            st.divider()
+            st.subheader("Teste de permutação PLS-DA")
+            c1, c2 = st.columns(2)
+            with c1:
+                n_permutations = st.slider(
+                    "Número de permutações",
+                    min_value=10,
+                    max_value=500,
+                    value=100,
+                    step=10,
+                    key="plsda_n_permutations_br",
+                )
+            with c2:
+                permutation_metric = st.selectbox(
+                    "Métrica para o histograma",
+                    ["Q2", "Accuracy", "Balanced_accuracy", "R2"],
+                    index=0,
+                    key="plsda_perm_metric_br",
+                )
 
-        # -------------------------
-        # Download all
-        # -------------------------
+            with st.spinner("Executando teste de permutação..."):
+                permutation_df, permutation_summary_df = compute_plsda_permutation_test(
+                    X=X,
+                    y=y,
+                    observed_metrics_df=metrics_df,
+                    max_components=int(max_components),
+                    cv_splits=int(cv_folds),
+                    n_permutations=int(n_permutations),
+                    random_state=42,
+                )
+
+            st.dataframe(permutation_summary_df, use_container_width=True)
+            fig_perm = make_plsda_permutation_plot(
+                permutation_df=permutation_df,
+                permutation_summary_df=permutation_summary_df,
+                metric=permutation_metric,
+            )
+            st.plotly_chart(fig_perm, use_container_width=True, config={"displaylogo": False})
+            store_fig("plsda_permutation_test", fig_perm)
+            add_download_html_button(fig_perm, "Download HTML: teste de permutação", "plsda_permutation_test")
+            figs_local["plsda_permutation_test"] = fig_perm
+
+            st.download_button(
+                "Download resultados das permutações (CSV)",
+                data=permutation_df.to_csv(index=False).encode("utf-8"),
+                file_name="plsda_permutation_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.divider()
         st.download_button(
-            "Download ALL Validation plots (ZIP of HTML)",
+            "Download de todos os gráficos de validação (ZIP de HTML)",
             data=zip_html(figs_local),
             file_name="validation_plots_html.zip",
             mime="application/zip",
             use_container_width=True,
         )
-
-        # -------------------------
-        # Text report
-        # -------------------------
-        st.divider()
-        st.subheader("Relatório de classificação (texto)")
-
-        with st.expander("Help — Relatório de classificação", expanded=False):
-            st.markdown(PARAM_HELP["validation_classification_report"])
-
-        st.code(classification_report(y_true, y_pred), language="text")
 
 # -------------------------
 # 6) Univariate Analysis
